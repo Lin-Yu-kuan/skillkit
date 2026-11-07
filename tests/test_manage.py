@@ -52,7 +52,9 @@ def test_load_config_defaults(tmp_path):
 
 
 def test_load_config_override(tmp_path):
-    (tmp_path / manage.CONFIG_FILENAME).write_text(
+    cfg_path = tmp_path / manage.CONFIG_FILENAME
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
         json.dumps({"repository": "https://github.com/acme/tools", "site_name": "tools"}),
         encoding="utf-8",
     )
@@ -153,7 +155,7 @@ def test_init_is_idempotent(tmp_path):
     assert first == second
     assert (target / manage.CONFIG_FILENAME).exists()
     assert (target / "GEMINI.md").exists()
-    assert (target / "manage.cmd").exists()
+    assert (target / manage.SHIM_FILENAME).exists()
     assert (target / ".github" / "workflows" / "skills-ci.yml").exists()
     assert not (target / "scripts" / "manage.py").exists()
 
@@ -185,7 +187,9 @@ def test_new_rejects_duplicate_and_bad_input(tmp_path):
 
 
 def test_empty_repo_lint_and_sync(tmp_path):
-    (tmp_path / manage.CONFIG_FILENAME).write_text(
+    cfg_path = tmp_path / manage.CONFIG_FILENAME
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
         json.dumps({"repository": "https://github.com/acme/empty"}), encoding="utf-8"
     )
     manage.configure(manage.load_config(tmp_path)[0])

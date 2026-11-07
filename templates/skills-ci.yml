@@ -26,7 +26,7 @@ jobs:
         with:
           repository: {{KIT_REPO}}
           ref: {{KIT_REF}}
-          path: .skillkit
+          path: .ci/skillkit
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -44,10 +44,10 @@ jobs:
           done
 
       - name: Lint skills
-        run: python .skillkit/manage.py lint
+        run: python .ci/skillkit/manage.py lint
 
       - name: Check generated files are in sync
-        run: python .skillkit/manage.py sync --check
+        run: python .ci/skillkit/manage.py sync --check
 
       - name: Run skill tests
         run: python -m pytest -q

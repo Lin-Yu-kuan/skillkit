@@ -17,7 +17,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import ntpath
+import os
 import re
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
@@ -201,11 +204,28 @@ def load_config(root: Path) -> Tuple[Dict[str, Any], bool]:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError(f"{path.name} 不是合法 JSON：{exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path.name} 必須是 JSON 物件")
     config.update({k: v for k, v in data.items() if v not in (None, "")})
     return config, True
 
 
 configure(dict(DEFAULT_CONFIG))
+
+
+def _frontmatter_scalar(value: str) -> str:
+    """Decode our supported quoted scalars without stripping literal end quotes."""
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'")
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        try:
+            decoded = json.loads(value)
+            if isinstance(decoded, str):
+                return decoded
+        except ValueError:
+            pass
+        return value[1:-1]
+    return value
 
 
 def parse_frontmatter(content: str) -> Tuple[Dict[str, str], str]:
@@ -252,7 +272,7 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, str], str]:
         if list_mode:
             item = re.match(r"^\s+-\s+(.*)$", line)
             if item:
-                list_buf.append(item.group(1).strip().strip("\"'"))
+                list_buf.append(_frontmatter_scalar(item.group(1).strip()))
                 continue
             if current_key:
                 data[current_key] = "\n".join(list_buf)
@@ -272,7 +292,7 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, str], str]:
                 list_mode = True
                 list_buf = []
             else:
-                data[key] = val.strip("\"'")
+                data[key] = _frontmatter_scalar(val)
 
     if multiline_mode and current_key:
         data[current_key] = " ".join([s for s in multiline_buf if s]).strip()
@@ -281,6 +301,40 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, str], str]:
 
     body = "\n".join(lines[end_idx + 1 :])
     return data, body
+
+
+def parse_usage_contract(frontmatter: Dict[str, str]) -> Tuple[List[str], List[Dict[str, str]]]:
+    """Optional display contract; never infer a callable interface from prose."""
+    usage = [line.strip() for line in frontmatter.get("usage", "").splitlines() if line.strip()]
+    if "usage" in frontmatter and not usage:
+        raise ValueError("usage 已宣告但沒有呼叫範本")
+    if any(line.startswith(("[", "{")) for line in usage):
+        raise ValueError("usage 請使用單行字串或 - 列表，不支援 inline array 或物件")
+    params: List[Dict[str, str]] = []
+    seen = set()
+    for line in frontmatter.get("params", "").splitlines():
+        fields = [part.strip() for part in line.split("|", 2)]
+        if len(fields) != 3 or not all(fields):
+            raise ValueError(f"params 格式須為「名稱 | 必填/選填/條件必填 | 說明」：{line}")
+        name, requirement, description = fields
+        if requirement not in ("必填", "選填", "條件必填"):
+            raise ValueError(f"params 性質不支援「{requirement}」：{name}")
+        if name in seen:
+            raise ValueError(f"params 重複宣告：{name}")
+        seen.add(name)
+        params.append({"name": name, "requirement": requirement, "description": description})
+    if "params" in frontmatter and not params:
+        raise ValueError("params 已宣告但沒有參數；無參數時請省略此欄位")
+    return usage, params
+
+
+def _contract_frontmatter(usage: List[str], params: List[str]) -> str:
+    lines: List[str] = []
+    for key, values in (("usage", usage), ("params", params)):
+        if values:
+            lines.append(f"{key}:")
+            lines.extend("  - '" + value.replace("'", "''") + "'" for value in values)
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 class SkillInfo:
@@ -425,6 +479,7 @@ def build_manifest(skills: List[SkillInfo], texts: Dict[str, str]) -> str:
     """產生 skills.json：版本、SHA-256 與觸發詞的機器可讀索引。"""
     entries: List[Dict[str, Any]] = []
     for s in sorted(skills, key=lambda x: x.dir_name):
+        usage, params = parse_usage_contract(s.frontmatter)
         content = texts.get(s.dir_name, "")
         entries.append(
             {
@@ -440,6 +495,11 @@ def build_manifest(skills: List[SkillInfo], texts: Dict[str, str]) -> str:
                 "triggers": s.triggers,
             }
         )
+        # Additive schema-1 fields: old skills keep their original manifest shape.
+        if usage:
+            entries[-1]["usage"] = usage
+        if params:
+            entries[-1]["params"] = params
     manifest = {"schema": 1, "repository": REPO_URL, "skills": entries}
     return json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
@@ -474,6 +534,10 @@ def lint_skills(root: Path) -> int:
         for key in REQUIRED_FRONTMATTER_KEYS:
             if not s.frontmatter.get(key):
                 err(f"SKILL.md 缺少必填 Frontmatter 欄位: `{key}`")
+        try:
+            parse_usage_contract(s.frontmatter)
+        except ValueError as exc:
+            err(str(exc))
 
         # 2. 名稱與版本格式
         if s.frontmatter.get("name") and s.frontmatter["name"] != s.dir_name:
@@ -913,7 +977,11 @@ def sync_all(root: Path, check_only: bool = False) -> int:
             injected.append(s.dir_name)
 
     new_readme = generate_readme(skills)
-    new_manifest = build_manifest(skills, texts)
+    try:
+        new_manifest = build_manifest(skills, texts)
+    except ValueError as exc:
+        print(f"❌ 參數契約無效，未寫入同步產物：{exc}")
+        return 1
 
     if check_only:
         problems: List[str] = []
@@ -1197,7 +1265,9 @@ def cmd_render(root: Path) -> int:
 
 
 def _new_skill_md(name: str, category: str, label: str, summary: str,
-                  triggers: List[str], package: bool) -> str:
+                  triggers: List[str], package: bool,
+                  usage: Optional[List[str]] = None,
+                  params: Optional[List[str]] = None) -> str:
     trigger_yaml = json.dumps(triggers, ensure_ascii=False)
     package_hint = (
         "完整套件更新（`scripts/` 等附屬檔案）請重跑本技能 `README.md` 的安裝指令。"
@@ -1213,7 +1283,7 @@ summary: {summary}
 description: >-
   {summary}
   亦支援在使用者要求「更新此技能 / 檢查最新版本」時自動調用以進行線上更新。
-triggers: {trigger_yaml}
+{_contract_frontmatter(usage or [], params or [])}triggers: {trigger_yaml}
 repository: {REPO_URL}
 update_url: {RAW_BASE_URL}/{name}/SKILL.md
 ---
@@ -1333,12 +1403,23 @@ def cmd_new(args: argparse.Namespace, root: Path) -> int:
         return 1
     label = args.label.strip() or CATEGORY_DEFINITIONS[args.category]["badge"]
 
+    usage = getattr(args, "usage", None) or []
+    params = getattr(args, "params", None) or []
+    try:
+        if any(not value.strip() or "\n" in value or "\r" in value for value in usage + params):
+            raise ValueError("每個 --usage / --params 必須是非空的單行文字，可重複指定")
+        contract, _ = parse_frontmatter("---\n" + _contract_frontmatter(usage, params) + "---\n")
+        parse_usage_contract(contract)
+    except ValueError as exc:
+        print(f"❌ {exc}")
+        return 1
+
     skill_dir.mkdir(parents=True)
     if args.package:
         (skill_dir / "scripts").mkdir()
 
     with (skill_dir / "SKILL.md").open("w", encoding="utf-8", newline="\n") as fh:
-        fh.write(_new_skill_md(name, args.category, label, summary, triggers, args.package))
+        fh.write(_new_skill_md(name, args.category, label, summary, triggers, args.package, usage, params))
     with (skill_dir / "README.md").open("w", encoding="utf-8", newline="\n") as fh:
         fh.write(_new_readme(name, summary, args.package))
 
@@ -1349,7 +1430,247 @@ def cmd_new(args: argparse.Namespace, root: Path) -> int:
     return code
 
 
-def main() -> int:
+def _is_managed_repo(root: Path) -> bool:
+    return any((root / filename).is_file() for filename in (CONFIG_FILENAME, LEGACY_CONFIG_FILENAME))
+
+
+def query_catalog(kit_root: Path, selector: Optional[str] = None) -> Tuple[List[Tuple[Path, SkillInfo]], List[Path], List[str]]:
+    """Scan only opted-in sibling repositories (or one explicitly selected repo)."""
+    errors: List[str] = []
+    entries: List[Tuple[Path, SkillInfo]] = []
+    roots: List[Path] = []
+    explicit = Path(selector).expanduser() if selector else None
+    try:
+        if explicit is not None and explicit.is_dir():
+            candidates = [explicit.resolve()]
+        else:
+            candidates = sorted(kit_root.parent.iterdir())
+        seen = set()
+        for root in candidates:
+            if not root.is_dir() or root.name.startswith(".") or not _is_managed_repo(root):
+                continue
+            if selector and not (explicit is not None and explicit.is_dir()) and root.name.casefold() != selector.casefold():
+                continue
+            root = root.resolve()
+            if root in seen:
+                continue
+            seen.add(root)
+            roots.append(root)
+            try:
+                # Validate config without mutating the governance module's globals.
+                load_config(root)
+                for folder in sorted(root.iterdir()):
+                    if folder.name.startswith(".") or folder.name in IGNORE_DIRS or not folder.is_dir():
+                        continue
+                    if not (folder / "SKILL.md").is_file():
+                        continue
+                    try:
+                        entries.append((root, SkillInfo(folder)))
+                    except (OSError, UnicodeError, ValueError) as exc:
+                        errors.append(f"無法讀取 {folder / 'SKILL.md'}：{exc}")
+            except (OSError, UnicodeError, ValueError, TypeError) as exc:
+                errors.append(f"無法讀取倉庫 {root}：{exc}")
+    except OSError as exc:
+        errors.append(f"無法盤點倉庫：{exc}")
+    if selector and not roots:
+        errors.append(f"找不到受治理倉庫：{selector}（須有 {CONFIG_FILENAME}）")
+    return entries, roots, errors
+
+
+def _print_query_list(entries: List[Tuple[Path, SkillInfo]]) -> None:
+    previous = None
+    for root, skill in sorted(entries, key=lambda pair: (pair[1].category, pair[1].name, str(pair[0]))):
+        if skill.category != previous:
+            print(f"\n[{skill.category}]")
+            previous = skill.category
+        contract = "已宣告用法" if skill.frontmatter.get("usage") else "未宣告用法"
+        print(f"  {skill.name} | v{skill.version or '?'} | {root.name} | {contract}")
+        print(f"    {skill.summary or skill.description}")
+        if skill.triggers:
+            print(f"    觸發詞：{'、'.join(skill.triggers)}")
+
+
+def copy_usage(text: str) -> None:
+    """Pass Unicode data over stdin, never interpolate skill text into shell code."""
+    if sys.platform != "win32":
+        raise OSError("--copy 第一版僅支援 Windows；請複製畫面上的呼叫範本")
+    powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); "
+        "Set-Clipboard -Value ([Console]::In.ReadToEnd())"
+    )
+    result = subprocess.run(
+        [str(powershell), "-NoProfile", "-NonInteractive", "-Command", script],
+        input=text.encode("utf-8"), capture_output=True, timeout=10,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if result.returncode:
+        raise OSError("Windows 剪貼簿寫入失敗；請複製畫面上的呼叫範本")
+
+
+def cmd_query(args: argparse.Namespace, kit_root: Path) -> int:
+    entries, roots, errors = query_catalog(kit_root, args.repo)
+    for error in errors:
+        print(f"⚠️ {error}", file=sys.stderr)
+    name = args.name
+    if name in (None, "list"):
+        if args.copy or args.example != 1:
+            print("❌ 複製或指定範本前，請提供技能名稱。", file=sys.stderr)
+            return 2
+        print(f"受治理倉庫：{len(roots)} 個；技能：{len(entries)} 個（不掃描已安裝技能）")
+        for root in roots:
+            print(f"  {root.name}: {root}")
+        _print_query_list(entries)
+        print('\n用法：skill <名稱或關鍵字> /? | skill <名稱> --repo <倉庫名稱或路徑> --copy [--example 2]')
+        return 1 if errors else 0
+
+    needle = name.casefold()
+    exact = [(root, skill) for root, skill in entries if skill.name.casefold() == needle]
+    matches = exact or [(root, skill) for root, skill in entries
+                        if needle in skill.name.casefold() or any(needle in trigger.casefold() for trigger in skill.triggers)]
+    if not matches:
+        print(f"❌ 找不到技能：{name}", file=sys.stderr)
+        return 1
+    if not exact and len(matches) > 1:
+        print("找到多個候選，請指定完整名稱或 --repo：")
+        _print_query_list(matches)
+        return 2
+    if args.copy and (len(matches) != 1 or errors):
+        print("❌ 來源不唯一或盤點不完整，未複製。請用 --repo 指定來源。", file=sys.stderr)
+        _print_query_list(matches)
+        return 2
+    if args.example < 1:
+        print("❌ --example 必須是從 1 開始的範本編號。", file=sys.stderr)
+        return 2
+
+    result = 1 if errors else 0
+    for root, skill in matches:
+        print(f"\n{skill.name} | v{skill.version or '?'} | {root.name}")
+        print(f"來源：{skill.skill_md}")
+        print(skill.description or skill.summary)
+        if skill.triggers:
+            print(f"觸發詞：{'、'.join(skill.triggers)}")
+        try:
+            usage, params = parse_usage_contract(skill.frontmatter)
+        except ValueError as exc:
+            print(f"❌ 參數契約無效：{exc}", file=sys.stderr)
+            result = 1
+            continue
+        if usage:
+            print("呼叫範本（貼到支援此技能的 AI 對話；不在終端機執行）：")
+            for index, example in enumerate(usage, 1):
+                print(f"  {index}. {example}")
+        else:
+            print("未宣告呼叫範本，請閱讀上方來源文件。")
+        if params:
+            print("參數／模式：")
+            for param in params:
+                print(f"  {param['name']} | {param['requirement']} | {param['description']}")
+        else:
+            print("未宣告參數契約；不代表此技能沒有參數。")
+        if args.copy:
+            if args.example > len(usage):
+                print("❌ 沒有指定編號的呼叫範本，未複製。", file=sys.stderr)
+                return 1
+            try:
+                copy_usage(usage[args.example - 1])
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"❌ {exc}", file=sys.stderr)
+                return 1
+            print(f"✅ 已複製第 {args.example} 個範本；請替換其中的佔位路徑。")
+    return result
+
+
+def update_path_value(value: str, directory: str, remove: bool = False) -> str:
+    """Change only this installation's entry; preserve unrelated raw PATH text."""
+    if any(char in directory for char in (';', '"', '\n', '\r')):
+        raise ValueError("skillkit 路徑含 PATH 無法安全表示的字元")
+    def normalized(entry: str) -> str:
+        return ntpath.normcase(ntpath.normpath(ntpath.expandvars(entry.strip().strip('"'))))
+    target = normalized(directory)
+    parts = value.split(";") if value else []
+    matching = [index for index, entry in enumerate(parts) if entry.strip() and normalized(entry) == target]
+    if remove:
+        return ";".join(entry for index, entry in enumerate(parts) if index not in matching)
+    if matching:
+        return value
+    return value + (";" if value and not value.endswith(";") else "") + directory
+
+
+def read_user_path() -> Tuple[str, int]:
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_QUERY_VALUE) as key:
+            value, kind = winreg.QueryValueEx(key, "Path")
+    except FileNotFoundError:
+        return "", winreg.REG_EXPAND_SZ
+    if kind not in (winreg.REG_SZ, winreg.REG_EXPAND_SZ) or not isinstance(value, str):
+        raise ValueError("使用者 PATH 不是字串型別，未修改")
+    return value, kind
+
+
+def write_user_path(value: str, kind: int) -> None:
+    import winreg
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as key:
+        winreg.SetValueEx(key, "Path", 0, kind, value)
+
+
+def broadcast_environment_change() -> bool:
+    import ctypes
+    from ctypes import wintypes
+    send = ctypes.WinDLL("user32", use_last_error=True).SendMessageTimeoutW
+    send.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPCWSTR,
+                     wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+    send.restype = ctypes.c_ssize_t
+    result = ctypes.c_size_t()
+    # WM_SETTINGCHANGE / HWND_BROADCAST / SMTO_ABORTIFHUNG; timeout per window.
+    return bool(send(0xFFFF, 0x001A, 0, "Environment", 0x0002, 100, ctypes.byref(result)))
+
+
+def cmd_setup(args: argparse.Namespace, kit_root: Path) -> int:
+    if sys.platform != "win32":
+        print("❌ setup 第一版僅支援 Windows；其他平台請使用 python manage.py。")
+        return 1
+    if not args.remove:
+        missing = [name for name in ("skill.cmd", "skillkit.cmd") if not (kit_root / name).is_file()]
+        if missing:
+            print(f"❌ 缺少入口檔：{', '.join(missing)}，未修改 PATH。")
+            return 1
+    try:
+        previous, kind = read_user_path()
+        updated = update_path_value(previous, str(kit_root), args.remove)
+        action = "移除" if args.remove else "加入"
+        print(f"使用者 PATH：{action} {kit_root}")
+        if updated == previous:
+            print("✅ 無需變更。")
+        elif args.dry_run:
+            print("預覽模式，未修改 PATH。")
+        else:
+            write_user_path(updated, kind)
+            print("✅ 已更新使用者 PATH。")
+            try:
+                if not broadcast_environment_change():
+                    print("⚠️ 環境變更通知逾時；PATH 已儲存，請重新啟動終端機宿主。")
+            except OSError as exc:
+                print(f"⚠️ PATH 已儲存，但環境變更通知失敗：{exc}")
+    except (OSError, ValueError) as exc:
+        print(f"❌ PATH 設定失敗：{exc}")
+        return 1
+    if not args.remove:
+        entries, roots, errors = query_catalog(kit_root)
+        print(f"盤點：{len(roots)} 個受治理倉庫，{len(entries)} 個技能。")
+        for root in roots:
+            print(f"  {root.name}: {root}")
+        for error in errors:
+            print(f"⚠️ {error}", file=sys.stderr)
+        if errors:
+            print("⚠️ 盤點不完整；上方 PATH 設定結果不受影響。")
+    print("目前終端機的 PATH 不會被子程序更新；請重新開啟終端機，必要時重啟其宿主程式。")
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     if hasattr(sys.stderr, "reconfigure"):
@@ -1363,6 +1684,17 @@ def main() -> int:
     sync_p.add_argument("--check", action="store_true", help="僅檢查是否同步，不寫入檔案")
     sub.add_parser("list", help="依領域列出所有技能")
     sub.add_parser("render", help="用 templates/ 重新產生 GEMINI.md 與 CI workflow")
+
+    query_p = sub.add_parser("query", add_help=False, help="查詢受治理倉庫中的技能與參數")
+    query_p.add_argument("name", nargs="?", help="技能名稱、關鍵字或 list")
+    query_p.add_argument("-h", "--help", action="store_true", help="顯示技能用法或總覽")
+    query_p.add_argument("--repo", help="倉庫名稱或路徑；只接受已接入 skillkit 的倉庫")
+    query_p.add_argument("-c", "--copy", action="store_true", help="複製唯一技能的呼叫範本")
+    query_p.add_argument("--example", type=int, default=1, help="複製第幾個範本（預設 1）")
+
+    setup_p = sub.add_parser("setup", help="將本工具目錄加入 Windows 使用者 PATH")
+    setup_p.add_argument("--dry-run", action="store_true", help="預覽，不修改 PATH")
+    setup_p.add_argument("--remove", action="store_true", help="只移除本工具目錄的 PATH 項目")
 
     init_p = sub.add_parser("init", help="在新資料夾建立治理設定與產物（config、GEMINI、CI、manage.cmd）")
     init_p.add_argument("--dir", required=True, help="目標資料夾（不存在會建立）")
@@ -1381,8 +1713,18 @@ def main() -> int:
     new_p.add_argument("--summary", required=True, help="一句話簡介")
     new_p.add_argument("--triggers", required=True, help="逗號分隔的觸發詞")
     new_p.add_argument("--package", action="store_true", help="建立套件型技能（含 scripts/）")
+    new_p.add_argument("--usage", action="append", help="AI 對話呼叫範本，可重複指定")
+    new_p.add_argument("--params", "--param", action="append", help="名稱 | 必填/選填/條件必填 | 說明，可重複指定")
 
-    args = parser.parse_args()
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    # Windows /? is an alias for help; skill.cmd forwards it verbatim.
+    arguments = ["--help" if arg == "/?" else arg for arg in arguments]
+    args = parser.parse_args(arguments)
+    kit_root = Path(__file__).resolve().parent
+    if args.cmd == "query":
+        return cmd_query(args, kit_root)
+    if args.cmd == "setup":
+        return cmd_setup(args, kit_root)
     root = Path(args.root).expanduser().resolve()
 
     if args.cmd == "init":

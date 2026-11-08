@@ -77,6 +77,10 @@
 
 ## 四、自動化總目錄同步與體檢規範（Automated Governance）
 
+在 skillkit 目錄執行 `python manage.py setup` 可註冊 Windows 使用者 PATH；重新開啟終端機後可用 `skillkit lint`／`skillkit sync`（仍須在技能倉庫根目錄執行）。`skill <名稱> /?` 查閱同層受治理倉庫的技能，`--repo <倉庫名稱或路徑>` 選擇來源，`--copy --example 2` 複製指定呼叫範本。查詢唯讀，不掃描已安裝技能；同名來源不會自動合併。
+
+技能可選填 `usage`（單行字串或範本列表）與 `params`（列表，每項 `名稱 | 必填/選填/條件必填 | 說明`）。不同模式使用獨立範本，條件必填需寫明條件；範本是 AI 對話文字，不是腳本 CLI。`lint` 驗證契約，`sync` 將契約加入 manifest；未宣告的技能保持相容，查詢不從內文推導參數。完整格式見 skillkit README。
+
 每當專案內新增、刪除或修改任何 Skill 時，**嚴禁僅靠人工手改根目錄 `README.md`**，必須執行治理工具：
 
 ```powershell

@@ -3,6 +3,61 @@
 `mySkill`、`mySkill-private`、`workflow` 等技能倉庫共用的規則、範本與驗證工具。
 放在 `D:\develop\AI\skillkit`，與各技能倉庫同層。
 
+## Windows 全域指令
+
+需要可執行的 `python`（Python 3.10+），執行階段僅使用標準函式庫。Clone 後執行：
+
+```powershell
+python D:\develop\AI\skillkit\manage.py setup --dry-run  # 預覽
+python D:\develop\AI\skillkit\manage.py setup            # 加入使用者 PATH
+```
+
+`setup` 以工具實際所在目錄為準，保留既有使用者 PATH 與登錄值型別，重複執行不重複加入；不修改系統 PATH。需要重新開啟終端機，必要時重啟 Windows Terminal／編輯器等宿主程式。可先在 PowerShell 用 `& 'D:\develop\AI\skillkit\skill.cmd' /?` 驗證入口。
+
+搬移或刪除工具前，在舊位置執行 `python manage.py setup --remove`；搬移後在新位置重新執行 `setup`。`--remove --dry-run` 可預覽移除，僅處理該工具目錄的 PATH 項目。第一版不提供 macOS／Linux 的全域安裝，但可直接用 Python 執行查詢及原有治理命令。
+
+```powershell
+skill /?                                      # 所有受治理倉庫的技能
+skill list                                    # 同上
+skill analyze-exam-subject /?                  # 技能描述、用法與參數
+skill analyze-exam-subject -h                  # 同上，不是 argparse 說明
+skill evo                                     # 名稱／觸發詞的不分大小寫子字串匹配
+skill skill-evolution --repo workflow          # 指定同名技能的來源
+skill analyze-exam-subject --copy --example 2  # 複製第二個呼叫範本
+skill list --repo 'D:\其他位置\我的技能庫'       # 明確指定其他位置的受治理倉庫
+skillkit lint                                 # 在技能倉庫根目錄執行
+skillkit --root 'D:\技能庫' sync --check        # 明確指定治理根目錄
+```
+
+查詢預設只掃描 **skillkit 同層、具有 `.skillkit/config.json` 的倉庫**（相容舊版 `skills.config.json`）。不掃描全域已安裝技能、其他未納管目錄或網路；`skills_dir` 不影響查詢範圍。只讀取各倉庫第一層技能的最新 `SKILL.md`，不依賴可能過期的 `skills.json`，也不寫入檔案或執行技能腳本。
+
+精確名稱優先；同名技能按來源分開顯示。模糊匹配有多個候選時只列清單，須再指定完整名稱或 `--repo`。`--repo` 接受倉庫資料夾名稱或路徑；明確路徑也必須是受治理倉庫。讀取錯誤會顯示於 stderr，其他可讀來源仍會列出。
+
+`--copy`／`-c` 只在來源唯一且盤點完整時複製已宣告的範本，預設第 1 個；用 `--example N` 選其他範本。範本是貼給 AI 的文字，需要自行替換佔位路徑，不是終端機可執行命令。缺少用法時不從內文猜測、不複製；第一版不提供內文萃取。退出碼：`0` 成功、`1` 未找到／資料或操作錯誤、`2` 參數或匹配歧義。
+
+## 選填的用法與參數契約
+
+既有技能不必補欄位；缺少時仍可查詢，畫面會標示「未宣告」。多模式技能可用列表分別宣告範本：
+
+```yaml
+usage:
+  - '/analyze-exam-subject "<題庫PDF資料夾>"'
+  - '/analyze-exam-subject -revise "<_analysis或題庫路徑>"'
+params:
+  - '<題庫PDF資料夾> | 條件必填 | 一般分析模式需要；-revise 模式不需要'
+  - '-revise <路徑> | 選填 | 選用重新生成模式；使用此模式時必須提供既有成果位置'
+```
+
+`usage` 支援單行字串或 `- ` 列表；`params` 使用列表，每項為 `名稱 | 性質 | 說明`。性質限「必填」「選填」「條件必填」，條件寫在說明中。只用前兩個 `|` 分隔，說明可含 `|`，名稱不可含 `|`。清單項目建議用 YAML 單引號，內容的單引號寫成 `''`。不支援巢狀物件或 inline array 契約；此解析器不是完整 YAML 引擎。範本只表達既有 AI 對話用法，不代表新增了腳本 CLI 旗標。
+
+`lint` 檢查契約格式、空值、性質與重複名稱。`sync` 會先驗證契約再寫入，並在 schema 1 manifest 增加選填的 `usage`（字串陣列）及 `params`（`name`、`requirement`、`description` 物件陣列）；無契約技能維持原有欄位。
+
+```powershell
+skillkit new demo --category dev-tools --summary '示範技能' --triggers '示範' --usage '請使用 demo 檢查 <路徑>' --params '<路徑> | 必填 | 要檢查的目錄'
+```
+
+`--usage` 與 `--params`（別名 `--param`）可重複指定，每次傳入一行；對以連字號開頭的值使用 `--params='--flag | 選填 | 說明'`。
+
 ## 用法（在技能倉庫根目錄）
 
 ```powershell
@@ -32,7 +87,8 @@ python D:\develop\AI\skillkit\manage.py init --dir D:\develop\AI\<新專案> --r
 
 | 路徑 | 用途 |
 |---|---|
-| `manage.py` | 全部邏輯（lint / sync / render / init / new / list） |
+| `manage.py` | 全部邏輯（lint / sync / render / init / new / list / query / setup） |
+| `skill.cmd`、`skillkit.cmd` | Windows 全域查詢與治理入口，保留目前工作目錄 |
 | `templates/GEMINI.md` | 各專案 `GEMINI.md` 的來源（佔位符：`{{SITE_NAME}}`、`{{REPO_URL}}`、`{{RAW_BASE}}`、`{{ARCHIVE_ROOT}}`、`{{KIT_REPO}}`、`{{KIT_REF}}`、`{{KIT_CMD}}`） |
 | `templates/skills-ci.yml` | 各專案 CI workflow 的來源（會 checkout 本 repo 到 `.ci/skillkit`） |
 | `tests/` | pytest 測試 |

@@ -1,6 +1,6 @@
 # skillkit — 技能庫治理工具
 
-`mySkill`、`mySkill-private`、`workflow` 等技能倉庫共用的規則、範本與驗證工具。
+`mySkill`、`workflow`、`analyze-exam-subject` 等技能倉庫共用的規則、範本與驗證工具。
 放在 `D:\develop\AI\skillkit`，與各技能倉庫同層。
 
 ## Windows 全域指令
